@@ -1197,20 +1197,23 @@ Panel {
               }
             }
 
-            Text {
+            Rectangle {
               visible: seekMouse.containsMouse || root.seekDragging
               x: Math.max(0, Math.min(parent.width - width, parent.width * seekBar.frac - width / 2))
-              y: -Style.space(13)
-              text: root.formatTime(root.seekDragging ? root.seekDragSec : root.dispPosition())
-              color: root.foreground
-              font.family: root.fontFamily
-              font.pixelSize: Style.font.caption * 0.9
-              font.bold: true
-              padding: 2
-              background: Rectangle {
-                color: Qt.rgba(0, 0, 0, 0.65)
-                radius: 4
-                anchors.fill: parent
+              y: -Style.space(16)
+              width: bubbleTime.implicitWidth + Style.space(8)
+              height: bubbleTime.implicitHeight + Style.space(4)
+              radius: 4
+              color: Qt.rgba(0, 0, 0, 0.7)
+
+              Text {
+                id: bubbleTime
+                anchors.centerIn: parent
+                text: root.formatTime(root.seekDragging ? root.seekDragSec : root.dispPosition())
+                color: root.foreground
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption * 0.9
+                font.bold: true
               }
             }
 
@@ -1255,7 +1258,6 @@ Panel {
               color: root.dim
               font.family: root.fontFamily
               font.pixelSize: Style.font.caption
-              font.variant: Font.TabularFigures
             }
 
             Item {
@@ -1269,7 +1271,6 @@ Panel {
               color: root.dim
               font.family: root.fontFamily
               font.pixelSize: Style.font.caption
-              font.variant: Font.TabularFigures
             }
           }
         }
@@ -2113,7 +2114,6 @@ Panel {
               font.family: root.fontFamily
               font.pixelSize: Style.font.caption
               font.bold: true
-              font.variant: Font.TabularFigures
             }
 
             Item {
@@ -2127,7 +2127,6 @@ Panel {
               color: root.muted
               font.family: root.fontFamily
               font.pixelSize: Style.font.caption
-              font.variant: Font.TabularFigures
             }
 
             Item { width: Style.space(8); height: 1 }
@@ -2139,7 +2138,6 @@ Panel {
               font.family: root.fontFamily
               font.pixelSize: Style.font.caption
               font.bold: true
-              font.variant: Font.TabularFigures
             }
           }
 
