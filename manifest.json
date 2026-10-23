@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "maen.omaopus",
   "name": "OmaOpus",
-  "version": "1.2.0",
+  "version": "1.3.0",
   "author": "MaenExists (fork: soumilchoudhary)",
   "license": "MIT",
   "description": "Lightning-fast, ultra-lightweight YouTube music player for Omarchy OS — soumilv1 fork. Stream any track in under a second, download it as MP3 to your local library with a crash-safe background worker, and play offline. Includes real-time 32-band spectrum equalizer audio visualizer, seamless queue autoplay, persistent favorites, and a sleek top bar widget that runs under 15MB RAM.",

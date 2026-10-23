@@ -18,11 +18,14 @@ DOWNLOAD_LOG="$STATE_DIR/download.log"
 DOWNLOAD_QUEUE_JSON="$STATE_DIR/download_queue.json"
 DOWNLOAD_LOCK="$STATE_DIR/download.lock"
 ENQUEUE_LOCK="$STATE_DIR/enqueue.lock"
+TRIMS_JSON="$STATE_DIR/trims.json"
+PREVIEW_LOCK="$STATE_DIR/preview.lock"
 MUSIC_DIR="${OMAOPUS_MUSIC_DIR:-$HOME/Music/OmaOpus}"
 
 [ -f "$FAVORITES_JSON" ] || echo '[]' > "$FAVORITES_JSON"
 [ -f "$QUEUE_JSON" ] || echo '[]' > "$QUEUE_JSON"
 [ -f "$META_JSON" ] || echo '{}' > "$META_JSON"
+[ -f "$TRIMS_JSON" ] || echo '{}' > "$TRIMS_JSON"
 [ -f "$DOWNLOAD_JSON" ] || echo '{"status":"idle","url":"","title":"","file":"","percent":0,"queue":0}' > "$DOWNLOAD_JSON"
 [ -f "$DOWNLOADED_JSON" ] || echo '[]' > "$DOWNLOADED_JSON"
 [ -f "$DOWNLOAD_QUEUE_JSON" ] || echo '[]' > "$DOWNLOAD_QUEUE_JSON"
@@ -137,6 +140,11 @@ worker_running() {
   ( exec 9>>"$DOWNLOAD_LOCK" && ! flock -n 9 )
 }
 
+# Echo the stored trim JSON object {"start":..,"end":..} for a file path, or empty.
+get_trim() {
+  jq -c --arg p "$1" '.[$p] // empty' "$TRIMS_JSON" 2>/dev/null || true
+}
+
 cmd="${1:-status}"
 
 case "$cmd" in
@@ -171,6 +179,9 @@ case "$cmd" in
     vol=$(send_mpv '{"command":["get_property","volume"]}' | jq -r '.data // 70' 2>/dev/null || echo '70')
     meta=$(cat "$META_JSON" 2>/dev/null || echo '{}')
     prefs=$(cat "$PREFS_JSON" 2>/dev/null || echo '{"volume":70}')
+    cur_path=$(jq -r '.path // empty' <<<"$meta" 2>/dev/null || true)
+    trim=$(get_trim "$cur_path")
+    [ -n "$trim" ] || trim='null'
 
     state="stopped"
     if [ "$idle_state" = "false" ]; then
@@ -180,9 +191,10 @@ case "$cmd" in
         state="playing"
       fi
     else
-      # If idle and there are items in the queue, trigger AUTOPLAY next track
+      # If idle and there are items in the queue, trigger AUTOPLAY next track.
+      # Skipped while a trim preview is active so auditioning doesn't advance the queue.
       auto_play=$(get_pref "autoPlayQueue" "true")
-      if [ "$auto_play" = "true" ]; then
+      if [ "$auto_play" = "true" ] && [ ! -f "$PREVIEW_LOCK" ]; then
         queue_count=$(jq 'length' "$QUEUE_JSON" 2>/dev/null || echo 0)
         has_current_track=$(jq -r '.title // empty' "$META_JSON" 2>/dev/null || true)
         if [ "$queue_count" -gt 0 ] && [ -n "$has_current_track" ]; then
@@ -199,6 +211,7 @@ case "$cmd" in
       --argjson vol "$vol" \
       --argjson meta "$meta" \
       --argjson prefs "$prefs" \
+      --argjson trim "$trim" \
       '{
         ok: true,
         state: $state,
@@ -206,6 +219,7 @@ case "$cmd" in
         duration: $dur,
         volume: $vol,
         track: (if ($meta.title) then $meta else null end),
+        trim: $trim,
         preferences: $prefs
       }' > "$STATUS_JSON.tmp" && mv "$STATUS_JSON.tmp" "$STATUS_JSON"
     cat "$STATUS_JSON"
@@ -230,6 +244,7 @@ case "$cmd" in
     ;;
 
   stop)
+    rm -f "$PREVIEW_LOCK"
     send_mpv '{"command":["stop"]}' >/dev/null 2>&1 || true
     echo '{}' > "$META_JSON"
     play_sound click &
@@ -253,8 +268,42 @@ case "$cmd" in
     ;;
 
   prev)
-    send_mpv '{"command":["seek",0,"absolute"]}' >/dev/null 2>&1 || true
+    # Restart at the trim start when the current file has a trim, else 0
+    cur_path=$(jq -r '.path // empty' "$META_JSON" 2>/dev/null || true)
+    tstart=$(jq -r '.start // empty' <<<"$(get_trim "$cur_path")" 2>/dev/null || true)
+    if [ -n "$tstart" ]; then
+      send_mpv "{\"command\":[\"seek\",$tstart,\"absolute\"]}" >/dev/null 2>&1 || true
+    else
+      send_mpv '{"command":["seek",0,"absolute"]}' >/dev/null 2>&1 || true
+    fi
     "$0" status
+    ;;
+
+  seek)
+    pos="${2:-0}"
+    case "$pos" in
+      ''|*[!0-9.]*) pos=0 ;;
+    esac
+    send_mpv "{\"command\":[\"seek\",$pos,\"absolute\"]}" >/dev/null 2>&1 || true
+    "$0" status
+    ;;
+
+  time)
+    # Lightweight position poll: one socket round-trip for pos/dur/pause
+    ensure_daemon
+    out=$(printf '%s\n%s\n%s\n' \
+      '{"command":["get_property","time-pos"]}' \
+      '{"command":["get_property","duration"]}' \
+      '{"command":["get_property","pause"]}' \
+      | socat - "$MPV_SOCK" 2>/dev/null || true)
+    tpos=$(sed -n '1s/.*"data":\([^,}]*\).*/\1/p' <<<"$out" | head -n1)
+    tdur=$(sed -n '2s/.*"data":\([^,}]*\).*/\1/p' <<<"$out" | head -n1)
+    tpa=$(sed -n '3p' <<<"$out" | grep -o '"data":true' || true)
+    [ -n "$tpos" ] || tpos=0
+    [ -n "$tdur" ] || tdur=0
+    jq -n -c --argjson pos "$tpos" --argjson dur "$tdur" \
+      --argjson paused "$( [ -n "$tpa" ] && echo true || echo false )" \
+      '{ok:true, position:$pos, duration:$dur, paused:$paused}'
     ;;
 
   volume)
@@ -284,6 +333,7 @@ case "$cmd" in
     duration_str="${5:-}"
 
     if [ -n "$url" ]; then
+      rm -f "$PREVIEW_LOCK"
       # Save metadata immediately
       jq -n -c \
         --arg title "$title" \
@@ -629,8 +679,9 @@ case "$cmd" in
     fi
 
     saved=$(jq -c '.' "$DOWNLOADED_JSON" 2>/dev/null || echo '[]')
-    jq -n -c --argjson songs "$songs" --argjson pending "$pending" --argjson saved "$saved" \
-      '{ok:true, songs:$songs, pending:$pending, saved:$saved}'
+    trims=$(jq -c '.' "$TRIMS_JSON" 2>/dev/null || echo '{}')
+    jq -n -c --argjson songs "$songs" --argjson pending "$pending" --argjson saved "$saved" --argjson trims "$trims" \
+      '{ok:true, songs:$songs, pending:$pending, saved:$saved, trims:$trims}'
     ;;
 
   play-local)
@@ -642,17 +693,116 @@ case "$cmd" in
     title="${3:-$(basename "$path")}"
     title="${title%.*}"
     artist="${4:-Local file}"
+    rm -f "$PREVIEW_LOCK"
 
+    trim=$(get_trim "$path")
     dstr=$(ffprobe -v error -show_entries format=duration -of default=nw=1:nk=1 "$path" 2>/dev/null | head -n1 || true)
-    dmin=$(awk -v d="${dstr:-0}" 'BEGIN { t = d + 0; printf "%d:%02d", t / 60, t % 60 }')
+    if [ -n "$trim" ]; then
+      tstart=$(jq -r '.start' <<<"$trim")
+      tend=$(jq -r '.end' <<<"$trim")
+      dmin=$(awk -v a="$tstart" -v b="$tend" 'BEGIN { t = b - a; printf "%d:%02d", t / 60, t % 60 }')
+    else
+      dmin=$(awk -v d="${dstr:-0}" 'BEGIN { t = d + 0; printf "%d:%02d", t / 60, t % 60 }')
+    fi
 
     jq -n -c --arg title "$title" --arg artist "$artist" --arg path "$path" --arg duration "$dmin" \
       '{title:$title, artist:$artist, path:$path, duration_str:$duration}' > "$META_JSON"
 
-    send_mpv "{\"command\":[\"loadfile\",$(printf '%s' "$path" | jq -R .),\"replace\"]}" >/dev/null 2>&1 || true
+    if [ -n "$trim" ]; then
+      opts="start=$(jq -r '.start' <<<"$trim"),end=$(jq -r '.end' <<<"$trim")"
+      send_mpv "{\"command\":[\"loadfile\",$(printf '%s' "$path" | jq -R .),\"replace\",0,$(printf '%s' "$opts" | jq -R .)]}" >/dev/null 2>&1 || true
+    else
+      send_mpv "{\"command\":[\"loadfile\",$(printf '%s' "$path" | jq -R .),\"replace\"]}" >/dev/null 2>&1 || true
+    fi
     send_mpv '{"command":["set_property","pause",false]}' >/dev/null 2>&1 || true
     play_sound play &
     "$0" status
+    ;;
+
+  play-local-preview)
+    # Audition prospective trim bounds without saving; blocks queue autoplay
+    path="$2"
+    pstart="${3:-0}"
+    pend="${4:-0}"
+    if [ -z "$path" ] || [ ! -f "$path" ]; then
+      jq -n -c '{ok:false,error:"File not found"}'
+      exit 0
+    fi
+    case "$pstart$pend" in
+      ''|*[!0-9.]*)
+        jq -n -c '{ok:false,error:"Bad bounds"}'
+        exit 0
+        ;;
+    esac
+    title="${5:-$(basename "$path")}"
+    artist="${6:-Local file}"
+    echo "$path" > "$PREVIEW_LOCK"
+
+    dmin=$(awk -v a="$pstart" -v b="$pend" 'BEGIN { t = b - a; if (t < 0) t = 0; printf "%d:%02d", t / 60, t % 60 }')
+    jq -n -c --arg title "$title" --arg artist "$artist" --arg path "$path" --arg duration "$dmin" \
+      '{title:$title, artist:$artist, path:$path, duration_str:$duration}' > "$META_JSON"
+
+    opts="start=$pstart,end=$pend"
+    send_mpv "{\"command\":[\"loadfile\",$(printf '%s' "$path" | jq -R .),\"replace\",0,$(printf '%s' "$opts" | jq -R .)]}" >/dev/null 2>&1 || true
+    send_mpv '{"command":["set_property","pause",false]}' >/dev/null 2>&1 || true
+    "$0" status
+    ;;
+
+  trim-set)
+    path="$2"
+    tstart="$3"
+    tend="$4"
+    if [ -z "$path" ] || [ ! -f "$path" ]; then
+      jq -n -c '{ok:false,error:"File not found"}'
+      exit 0
+    fi
+    case "$path" in
+      "$MUSIC_DIR"/*) ;;
+      *)
+        jq -n -c '{ok:false,error:"Outside the library"}'
+        exit 0
+        ;;
+    esac
+    case "$tstart$tend" in
+      ''|*[!0-9.]*)
+        jq -n -c '{ok:false,error:"Bounds must be numbers"}'
+        exit 0
+        ;;
+    esac
+    dur=$(ffprobe -v error -show_entries format=duration -of default=nw=1:nk=1 "$path" 2>/dev/null | head -n1 || echo 0)
+    if ! awk -v a="$tstart" -v b="$tend" -v d="${dur:-0}" 'BEGIN {
+      if (a < 0 || b - a < 0.05) exit 1
+      if (d > 0 && b > d + 0.3) exit 1
+      exit 0
+    }'; then
+      jq -n -c '{ok:false,error:"Need 0 <= start < end <= duration"}'
+      exit 0
+    fi
+    jq -c --arg p "$path" --argjson s "$tstart" --argjson e "$tend" \
+      '.[$p] = {start:$s, end:$e}' "$TRIMS_JSON" > "$TRIMS_JSON.tmp" \
+      && mv "$TRIMS_JSON.tmp" "$TRIMS_JSON"
+    # Apply immediately if this file is the current track
+    cur=$(jq -r '.path // empty' "$META_JSON" 2>/dev/null || true)
+    if [ "$cur" = "$path" ]; then
+      "$0" play-local "$path" >/dev/null 2>&1 || true
+    fi
+    jq -n -c --arg path "$path" --argjson s "$tstart" --argjson e "$tend" \
+      '{ok:true, path:$path, trim:{start:$s, end:$e}}'
+    ;;
+
+  trim-clear)
+    path="$2"
+    if [ -z "$path" ]; then
+      jq -n -c '{ok:false,error:"No path"}'
+      exit 0
+    fi
+    jq -c --arg p "$path" 'del(.[$p])' "$TRIMS_JSON" > "$TRIMS_JSON.tmp" \
+      && mv "$TRIMS_JSON.tmp" "$TRIMS_JSON"
+    cur=$(jq -r '.path // empty' "$META_JSON" 2>/dev/null || true)
+    if [ "$cur" = "$path" ]; then
+      "$0" play-local "$path" >/dev/null 2>&1 || true
+    fi
+    jq -n -c --arg path "$path" '{ok:true, cleared:$path}'
     ;;
 
   delete-download)
@@ -741,7 +891,7 @@ case "$cmd" in
     ;;
 
   *)
-    echo "Usage: $0 {ensure|restart-session|prefetch <url>|status|play|pause|toggle|next|prev|stop|volume <0-100>|set-pref <key> <val>|get-prefs|play-url <url> [title] [artist] [dur]|queue-url <url> [title] [artist] [dur]|queue-list|queue-clear|set-queue <json>|favorites-list|favorites-toggle <json>|download [url] [title]|download-cancel <url>|_worker|downloads-list|play-local <path> [title] [artist]|delete-download <path>|sound <name>|search <query> [limit]}"
+    echo "Usage: $0 {ensure|restart-session|prefetch <url>|status|time|seek <sec>|play|pause|toggle|next|prev|stop|volume <0-100>|set-pref <key> <val>|get-prefs|play-url <url> [title] [artist] [dur]|queue-url <url> [title] [artist] [dur]|queue-list|queue-clear|set-queue <json>|favorites-list|favorites-toggle <json>|download [url] [title]|download-cancel <url>|_worker|downloads-list|play-local <path> [title] [artist]|play-local-preview <path> <start> <end> [title] [artist]|trim-set <path> <start> <end>|trim-clear <path>|delete-download <path>|sound <name>|search <query> [limit]}"
     exit 1
     ;;
 esac

@@ -28,9 +28,20 @@ Panel {
   property string currentTitle: ""
   property string currentArtist: ""
   property string currentUrl: ""
-  property int currentPositionSec: 0
-  property int totalDurationSec: 0
+  property real currentPositionSec: 0
+  property real totalDurationSec: 0
   property int volume: 70
+  property var currentTrim: null
+
+  // Seek bar state
+  property bool seekDragging: false
+  property real seekDragSec: 0
+
+  // Trim editor state (Downloads tab)
+  property var trimEditItem: null
+  property real trimEditDur: 1
+  property real trimEditStart: 0
+  property real trimEditEnd: 1
 
   // User Preferences
   property string activeTab: "search"
@@ -63,6 +74,7 @@ Panel {
   property var downloads: []
   property var pendingDownloads: []
   property var savedDownloads: []
+  property var trimsMap: {}
 
   readonly property bool currentDownloaded: downloadState === "done" && downloadUrl !== "" && downloadUrl === currentUrl
   readonly property bool currentDownloading: downloadState === "downloading" && downloadUrl !== "" && downloadUrl === currentUrl
@@ -250,10 +262,12 @@ Panel {
       root.downloads = d.songs || []
       root.pendingDownloads = d.pending || []
       root.savedDownloads = d.saved || []
+      root.trimsMap = d.trims || {}
     } catch (e) {
       root.downloads = []
       root.pendingDownloads = []
       root.savedDownloads = []
+      root.trimsMap = {}
     }
   }
 
@@ -393,11 +407,13 @@ Panel {
         root.currentUrl = data.track.path || data.track.url || ""
       }
 
+      root.currentTrim = (data.trim !== undefined && data.trim) ? data.trim : null
+
       if (data.duration) {
         root.totalDurationSec = Math.round(data.duration)
       }
-      if (data.position !== undefined) {
-        root.currentPositionSec = Math.round(data.position)
+      if (data.position !== undefined && data.position !== null) {
+        root.currentPositionSec = Number(data.position)
       }
       if (data.volume !== undefined) {
         root.volume = Math.round(data.volume)
@@ -452,6 +468,71 @@ Panel {
     if (!bytes || bytes <= 0) return "0 MB"
     if (bytes < 1024 * 1024) return Math.round(bytes / 1024) + " KB"
     return (bytes / (1024 * 1024)).toFixed(1) + " MB"
+  }
+
+  // Trim-aware display domain: when a trim is active the bar maps [start..end]
+  function dispDuration() {
+    if (root.currentTrim) return Math.max(0.5, Number(root.currentTrim.end) - Number(root.currentTrim.start))
+    return Math.max(0, root.totalDurationSec)
+  }
+
+  function dispPosition() {
+    var d = dispDuration()
+    if (root.currentTrim) {
+      var p = root.currentPositionSec - Number(root.currentTrim.start)
+      return Math.max(0, Math.min(d, p))
+    }
+    return Math.max(0, Math.min(d, root.currentPositionSec))
+  }
+
+  function seekToDisplay(sec) {
+    var real = root.currentTrim ? Number(root.currentTrim.start) + sec : sec
+    execActionWithArg("seek", String(real))
+  }
+
+  function trimFor(path) {
+    if (!path || !root.trimsMap[path]) return null
+    return root.trimsMap[path]
+  }
+
+  function refreshTime() {
+    if (timeProc.running) return
+    timeProc.running = true
+  }
+
+  function openTrimEditor(item) {
+    if (!item || !item.path) return
+    trimEditItem = item
+    trimEditDur = Math.max(1, Number(item.duration) || 1)
+    var t = trimFor(item.path)
+    if (t) {
+      trimEditStart = Math.max(0, Number(t.start))
+      trimEditEnd = Math.min(trimEditDur, Number(t.end))
+    } else {
+      trimEditStart = 0
+      trimEditEnd = trimEditDur
+    }
+  }
+
+  function commitTrim() {
+    if (!trimEditItem) return
+    trimProc.command = [root.backendPath, "trim-set", trimEditItem.path,
+      trimEditStart.toFixed(2), trimEditEnd.toFixed(2)]
+    trimProc.running = true
+  }
+
+  function clearTrim() {
+    if (!trimEditItem) return
+    trimProc.command = [root.backendPath, "trim-clear", trimEditItem.path]
+    trimProc.running = true
+  }
+
+  function previewTrim() {
+    if (!trimEditItem) return
+    previewProc.command = [root.backendPath, "play-local-preview", trimEditItem.path,
+      trimEditStart.toFixed(2), trimEditEnd.toFixed(2),
+      trimEditItem.title || "", trimEditItem.artist || ""]
+    previewProc.running = true
   }
 
   visible: true
@@ -638,6 +719,52 @@ Panel {
   Process {
     id: setQueueProc
     command: []
+  }
+
+  Process {
+    id: timeProc
+    command: [root.backendPath, "time"]
+    stdout: StdioCollector {
+      id: timeOut
+      waitForEnd: true
+    }
+    onExited: function(exitCode) {
+      if (exitCode === 0 && timeOut.text) {
+        try {
+          var d = JSON.parse(timeOut.text)
+          if (d.position !== undefined && d.position !== null) root.currentPositionSec = Number(d.position)
+          if (d.duration && Number(d.duration) > 0) root.totalDurationSec = Number(d.duration)
+        } catch (e) {
+          // Ignored
+        }
+      }
+    }
+  }
+
+  Process {
+    id: trimProc
+    stdout: StdioCollector {
+      waitForEnd: true
+    }
+    onExited: {
+      root.trimEditItem = null
+      root.refreshStatus()
+      root.refreshDownloads()
+    }
+  }
+
+  Process {
+    id: previewProc
+    command: []
+    onExited: root.refreshStatus()
+  }
+
+  // Smooth position updates while the panel is open and something is loaded
+  Timer {
+    interval: 700
+    running: root.opened && root.currentTitle !== "" && !root.seekDragging
+    repeat: true
+    onTriggered: root.refreshTime()
   }
 
   function prefetchTrack(url) {
@@ -922,7 +1049,7 @@ Panel {
       // Now Playing Hero Card
       Rectangle {
         width: parent.width - Style.space(28)
-        height: root.currentTitle ? Style.space(106) : Style.space(56)
+        height: root.currentTitle ? Style.space(144) : Style.space(56)
         radius: Style.cornerRadius
         color: Style.selectedFillFor(root.foreground, root.accent)
         clip: true
@@ -996,7 +1123,9 @@ Panel {
 
           Text {
             width: parent.width
-            text: root.currentArtist ? (root.currentArtist + (root.totalDurationSec > 0 ? "  ·  " + root.formatTime(root.currentPositionSec) + " / " + root.formatTime(root.totalDurationSec) : "")) : "Search tracks or pick from favorites below"
+            text: root.currentArtist
+              ? (root.currentArtist + (root.currentTrim ? "  ·  ✂ trimmed" : ""))
+              : "Search tracks or pick from favorites below"
             color: root.dim
             font.family: root.fontFamily
             font.pixelSize: Style.font.caption
@@ -1024,6 +1153,123 @@ Panel {
               iconText: "󰒭"
               tooltipText: "Next"
               onClicked: root.nextTrack()
+            }
+          }
+
+          // YouTube-style seek bar: click anywhere or drag to scrub
+          Item {
+            id: seekBar
+            visible: root.currentTitle !== ""
+            width: parent.width
+            height: Style.space(12)
+
+            readonly property real frac: {
+              var d = root.dispDuration()
+              if (d <= 0) return 0
+              var p = (root.seekDragging || seekMouse.pressed) ? root.seekDragSec : root.dispPosition()
+              return Math.max(0, Math.min(1, p / d))
+            }
+
+            Rectangle {
+              id: seekTrack
+              anchors.verticalCenter: parent.verticalCenter
+              width: parent.width
+              height: seekMouse.containsMouse || root.seekDragging ? Style.space(8) : Style.space(5)
+              radius: height / 2
+              color: Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.15)
+              Behavior on height { NumberAnimation { duration: 100 } }
+
+              Rectangle {
+                width: parent.width * seekBar.frac
+                height: parent.height
+                radius: parent.radius
+                color: root.accent
+              }
+
+              Rectangle {
+                x: Math.max(-width / 2, Math.min(parent.width - width / 2, parent.width * seekBar.frac - width / 2))
+                y: (parent.height - height) / 2
+                width: (seekMouse.containsMouse || root.seekDragging) ? Style.space(12) : 0
+                height: width
+                radius: width / 2
+                color: root.foreground
+                Behavior on width { NumberAnimation { duration: 100 } }
+              }
+            }
+
+            Text {
+              visible: seekMouse.containsMouse || root.seekDragging
+              x: Math.max(0, Math.min(parent.width - width, parent.width * seekBar.frac - width / 2))
+              y: -Style.space(13)
+              text: root.formatTime(root.seekDragging ? root.seekDragSec : root.dispPosition())
+              color: root.foreground
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption * 0.9
+              font.bold: true
+              padding: 2
+              background: Rectangle {
+                color: Qt.rgba(0, 0, 0, 0.65)
+                radius: 4
+                anchors.fill: parent
+              }
+            }
+
+            MouseArea {
+              id: seekMouse
+              anchors.fill: parent
+              hoverEnabled: true
+              cursorShape: Qt.PointingHandCursor
+              property real dragRatio: 0
+
+              function ratioAt(x) {
+                return Math.max(0, Math.min(1, x / Math.max(1, width)))
+              }
+
+              onPressed: function(mouse) {
+                root.seekDragging = true
+                dragRatio = ratioAt(mouse.x)
+                root.seekDragSec = dragRatio * root.dispDuration()
+              }
+              onPositionChanged: function(mouse) {
+                if (!root.seekDragging) return
+                dragRatio = ratioAt(mouse.x)
+                root.seekDragSec = dragRatio * root.dispDuration()
+              }
+              onReleased: function(mouse) {
+                if (root.seekDragging) {
+                  dragRatio = ratioAt(mouse.x)
+                  root.seekToDisplay(dragRatio * root.dispDuration())
+                }
+                root.seekDragging = false
+              }
+              onCanceled: root.seekDragging = false
+            }
+          }
+
+          Row {
+            visible: root.currentTitle !== ""
+            width: parent.width
+
+            Text {
+              text: root.formatTime(root.seekDragging ? root.seekDragSec : root.dispPosition())
+              color: root.dim
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+              font.variant: Font.TabularFigures
+            }
+
+            Item {
+              width: parent.width - x - seekDurText.width
+              height: 1
+            }
+
+            Text {
+              id: seekDurText
+              text: (root.currentTrim ? "✂ " : "") + root.formatTime(root.dispDuration())
+              color: root.dim
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+              font.variant: Font.TabularFigures
             }
           }
         }
@@ -1620,6 +1866,7 @@ Panel {
         }
 
         Row {
+          visible: root.trimEditItem === null
           width: parent.width - Style.space(28)
           Text {
             text: "DOWNLOADED TRACKS"
@@ -1646,6 +1893,7 @@ Panel {
 
         ListView {
           id: dlList
+          visible: root.trimEditItem === null
           width: parent.width - Style.space(28)
           height: Math.min(Style.space(300), Math.max(Style.space(48), count * Style.space(50)))
           clip: true
@@ -1682,7 +1930,7 @@ Panel {
               }
 
               Column {
-                width: parent.width - dlDelBtn.width - dlSizeLabel.width - Style.space(48)
+                width: parent.width - dlTrimBtn.width - dlDelBtn.width - dlSizeLabel.width - Style.space(56)
                 anchors.verticalCenter: parent.verticalCenter
                 spacing: Style.space(2)
 
@@ -1698,6 +1946,7 @@ Panel {
                 Text {
                   width: parent.width
                   text: (modelData.artist || "") + (modelData.duration > 0 ? "  ·  " + root.formatTime(modelData.duration) : "")
+                  + (root.trimFor(modelData.path) ? "  ·  ✂ trimmed" : "")
                   color: root.dim
                   font.family: root.fontFamily
                   font.pixelSize: Style.font.caption
@@ -1715,6 +1964,15 @@ Panel {
               }
 
               PanelActionButton {
+                id: dlTrimBtn
+                iconText: root.trimFor(modelData.path) ? "󰒅" : "󰏏"
+                tooltipText: root.trimFor(modelData.path) ? "Edit trim (✂ playback window active)" : "Trim start / end"
+                size: Style.space(24)
+                anchors.verticalCenter: parent.verticalCenter
+                onClicked: root.openTrimEditor(modelData)
+              }
+
+              PanelActionButton {
                 id: dlDelBtn
                 iconText: "󰅖"
                 tooltipText: "Delete file from disk"
@@ -1727,7 +1985,7 @@ Panel {
         }
 
         Text {
-          visible: root.downloads.length === 0
+          visible: root.trimEditItem === null && root.downloads.length === 0
           text: "Nothing saved yet. Play a track and hit ⭳ in the player, or press SUPER+ALT+D."
           color: root.muted
           font.family: root.fontFamily
@@ -1737,13 +1995,191 @@ Panel {
         }
 
         Text {
-          visible: root.downloads.length > 0
-          text: "Files live in ~/Music/OmaOpus — click a row to play offline."
+          visible: root.trimEditItem === null && root.downloads.length > 0
+          text: "Files live in ~/Music/OmaOpus — click a row to play offline, 󰏏 to trim."
           color: root.muted
           font.family: root.fontFamily
           font.pixelSize: Style.font.caption * 0.9
           horizontalAlignment: Text.AlignHCenter
           width: parent.width - Style.space(28)
+        }
+
+        // ── Trim editor (replaces the list while editing a track) ──────────
+        Column {
+          visible: root.trimEditItem !== null
+          width: parent.width - Style.space(28)
+          spacing: Style.space(8)
+
+          Text {
+            width: parent.width
+            text: "✂ TRIM · " + (root.trimEditItem ? (root.trimEditItem.title || "") : "")
+            color: root.foreground
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.caption
+            font.bold: true
+            elide: Text.ElideRight
+          }
+
+          Item {
+            id: trimTrackItem
+            width: parent.width
+            height: Style.space(22)
+
+            readonly property real startRatio: Math.max(0, Math.min(1, root.trimEditStart / Math.max(0.5, root.trimEditDur)))
+            readonly property real endRatio: Math.max(startRatio, Math.min(1, root.trimEditEnd / Math.max(0.5, root.trimEditDur)))
+
+            Rectangle {
+              anchors.verticalCenter: parent.verticalCenter
+              width: parent.width
+              height: Style.space(6)
+              radius: height / 2
+              color: Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.15)
+            }
+
+            Rectangle {
+              anchors.verticalCenter: parent.verticalCenter
+              x: parent.width * trimTrackItem.startRatio
+              width: parent.width * (trimTrackItem.endRatio - trimTrackItem.startRatio)
+              height: Style.space(6)
+              radius: height / 2
+              color: root.accent
+            }
+
+            Rectangle {
+              id: hStart
+              anchors.verticalCenter: parent.verticalCenter
+              x: Math.max(0, Math.min(trimTrackItem.width - width, trimTrackItem.width * trimTrackItem.startRatio - width / 2))
+              width: Style.space(14)
+              height: Style.space(14)
+              radius: width / 2
+              color: root.foreground
+              border.color: root.accent
+              border.width: 2
+
+              MouseArea {
+                anchors.fill: parent
+                cursorShape: Qt.SizeHorCursor
+                preventStealing: true
+                property real grabOffset: 0
+                onPressed: function(mouse) {
+                  grabOffset = (hStart.x + mouse.x) - (trimTrackItem.startRatio * trimTrackItem.width)
+                }
+                onPositionChanged: function(mouse) {
+                  if (!pressed) return
+                  var px = hStart.x + mouse.x - grabOffset
+                  var t = Math.max(0, Math.min(1, px / Math.max(1, trimTrackItem.width))) * root.trimEditDur
+                  root.trimEditStart = Math.min(t, root.trimEditEnd - 0.5)
+                  if (root.trimEditStart < 0) root.trimEditStart = 0
+                }
+              }
+            }
+
+            Rectangle {
+              id: hEnd
+              anchors.verticalCenter: parent.verticalCenter
+              x: Math.max(0, Math.min(trimTrackItem.width - width, trimTrackItem.width * trimTrackItem.endRatio - width / 2))
+              width: Style.space(14)
+              height: Style.space(14)
+              radius: width / 2
+              color: root.foreground
+              border.color: root.accent
+              border.width: 2
+
+              MouseArea {
+                anchors.fill: parent
+                cursorShape: Qt.SizeHorCursor
+                preventStealing: true
+                property real grabOffset: 0
+                onPressed: function(mouse) {
+                  grabOffset = (hEnd.x + mouse.x) - (trimTrackItem.endRatio * trimTrackItem.width)
+                }
+                onPositionChanged: function(mouse) {
+                  if (!pressed) return
+                  var px = hEnd.x + mouse.x - grabOffset
+                  var t = Math.max(0, Math.min(1, px / Math.max(1, trimTrackItem.width))) * root.trimEditDur
+                  root.trimEditEnd = Math.max(t, root.trimEditStart + 0.5)
+                  if (root.trimEditEnd > root.trimEditDur) root.trimEditEnd = root.trimEditDur
+                }
+              }
+            }
+          }
+
+          Row {
+            width: parent.width
+
+            Text {
+              text: root.formatTime(root.trimEditStart)
+              color: root.accent
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+              font.bold: true
+              font.variant: Font.TabularFigures
+            }
+
+            Item {
+              width: parent.width - x - trimSelLen.width - trimEndTxt.width - Style.space(16)
+              height: 1
+            }
+
+            Text {
+              id: trimSelLen
+              text: "(" + root.formatTime(Math.max(0, root.trimEditEnd - root.trimEditStart)) + ")"
+              color: root.muted
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+              font.variant: Font.TabularFigures
+            }
+
+            Item { width: Style.space(8); height: 1 }
+
+            Text {
+              id: trimEndTxt
+              text: root.formatTime(root.trimEditEnd)
+              color: root.accent
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+              font.bold: true
+              font.variant: Font.TabularFigures
+            }
+          }
+
+          Row {
+            spacing: Style.space(10)
+            anchors.horizontalCenter: parent.horizontalCenter
+
+            PanelActionButton {
+              iconText: "󰒃"
+              tooltipText: "Preview the selected region"
+              onClicked: root.previewTrim()
+            }
+
+            PanelActionButton {
+              iconText: "󰄾"
+              tooltipText: "Save trim (playback only — file untouched)"
+              onClicked: root.commitTrim()
+            }
+
+            PanelActionButton {
+              iconText: "󰅖"
+              tooltipText: "Remove trim"
+              onClicked: root.clearTrim()
+            }
+
+            PanelActionButton {
+              iconText: "󰅕"
+              tooltipText: "Cancel"
+              onClicked: root.trimEditItem = null
+            }
+          }
+
+          Text {
+            width: parent.width
+            text: "Playback metadata only — the MP3 on disk is never modified."
+            color: root.muted
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.caption * 0.9
+            horizontalAlignment: Text.AlignHCenter
+          }
         }
       }
 

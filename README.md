@@ -57,6 +57,14 @@ New state files (all under `~/.local/state/omaopus/`): `download.json`, `downloa
 - **Bigger panel** — 390×560 → 540×900 to fit the new tab.
 - **IPC additions** — `quickshell ipc call maen.omaopus download` and `... tab downloads` for keybinding integration (SUPER+ALT+D hint in the footer).
 
+### 🆕 v1.3.0 — Trim Editor + YouTube-style Seek Bar
+
+**Trim editor (Downloads tab, ✎ button):** set a start/end playback window for any downloaded song. Stored as metadata in `~/.local/state/omaopus/trims.json` — the MP3 on disk is **never modified**. Drag dual handles on a timeline, audition with 󰒃 Preview, save with 󰄾. Trimmed tracks show "✂ trimmed" and play only the selected region; the queue still advances automatically at the end. `prev` restarts at the trim start.
+
+**YouTube-style seek bar (Now Playing card):** click anywhere or drag to scrub, hover knob + time bubble, live position polled at ~700 ms via a lightweight `oma-player time` command. The bar automatically maps into the trim window when one is active (duration shows "✂ m:ss").
+
+New CLI: `oma-player seek <sec>`, `time`, `trim-set <path> <start> <end>`, `trim-clear <path>`, `play-local-preview <path> <start> <end>`.
+
 ---
 
 > *"Every once in a while, a tool comes along that changes how you interact with your desktop forever. Music shouldn't require a dedicated window, an extra workspace, or half a gigabyte of RAM. It should simply be there — woven into the cosmos of your bar."*
