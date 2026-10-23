@@ -1,16 +1,61 @@
-# OmaOpus 󱑽 — The Universe of Music. In Your Bar.
+# OmaOpus_soumilv1 󱑽 — The Universe of Music. In Your Bar. Now with Offline Downloads.
+
+> **Fork of [OmaOpus](https://github.com/MaenExists/omaopus) v1.1.0 by [MaenExists](https://github.com/MaenExists)**
+> Extended with a full offline download manager — stream from YouTube, save as MP3, play without a network.
+> All credit for the original player, visualizer, and bar-widget architecture goes to MaenExists. MIT license preserved.
 
 <p align="center">
   <img src="preview.png" alt="OmaOpus Showcase" width="100%">
 </p>
 
 <p align="center">
-  <a href="https://omarchyplugins.com/plugin.html?id=maen.omaopus"><img src="https://img.shields.io/badge/Omarchy_Marketplace-Verified-blue?style=flat-square&logo=linux" alt="Marketplace"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-emerald?style=flat-square" alt="License"></a>
+  <img src="https://img.shields.io/badge/Fork-soumilv1-orange?style=flat-square" alt="Fork">
   <img src="https://img.shields.io/badge/Memory_Footprint-<15MB_RAM-cyan?style=flat-square" alt="Memory">
   <img src="https://img.shields.io/badge/Stream_Latency-<0.5s-violet?style=flat-square" alt="Latency">
   <img src="https://img.shields.io/badge/Idle_CPU-0.0%-green?style=flat-square" alt="CPU">
 </p>
+
+---
+
+## 🆕 What's New in soumilv1 — Offline Download Manager
+
+Everything below is on top of upstream OmaOpus v1.1.0. The audio engine, search, queue, favorites, and 32-band visualizer are unchanged.
+
+### Backend (`oma-player`, +312 lines)
+
+| Feature | How it works |
+| :--- | :--- |
+| **Serial download worker** | Detached via `setsid` so downloads survive panel/shell reloads. Single worker guarded by `flock` (`download.lock`) — no parallel yt-dlp fights. |
+| **Download queue** | FIFO queue in `download_queue.json`, read-modify-write serialized with a second lock (`enqueue.lock`). Duplicate URLs are detected and deduped. |
+| **MP3 conversion** | `yt-dlp -x --audio-format mp3 --audio-quality 192K` with embedded metadata + thumbnail. Files land in `~/Music/OmaOpus` as `Title [videoId].mp3`. |
+| **Live progress** | A poll loop parses yt-dlp's log and streams percent updates into `download.json`; the UI's `FileView` reacts in real time. |
+| **Crash self-healing** | If the worker dies mid-download, `downloads-list` detects the stale "downloading" state (no lock holder), requeues the track at the FRONT, and respawns the worker. |
+| **Dedupe** | Video ID checked against `downloaded.json` — already-saved tracks short-circuit with "already in library". |
+| **Offline playback** | `play-local` loads any library file straight into mpv — no network, no URL resolution. |
+| **Safe delete** | `delete-download` refuses paths outside `~/Music/OmaOpus`, stops playback if the deleted file is current, and cleans `downloaded.json`. |
+| **Library scan** | `downloads-list` scans with `ffprobe` (title/artist/duration), caches results in `library.json` keyed by a name/size/mtime signature — repeat calls are instant. |
+
+New CLI surface:
+
+```bash
+oma-player download [url] [title]     # enqueue current or given track
+oma-player download-cancel <url>      # drop a queued (not active) download
+oma-player downloads-list             # library + pending queue + saved IDs (JSON)
+oma-player play-local <path> [title] [artist]
+oma-player delete-download <path>
+```
+
+New state files (all under `~/.local/state/omaopus/`): `download.json`, `downloaded.json`, `download_queue.json`, `download.log`, `library.json`, plus the two flock files.
+
+### UI (`BarWidget.qml`, +546 lines)
+
+- **4th tab: 󰈂 Downloads** — active-download card with live percent + progress bar, clickable pending queue (cancel with one click), and the full offline library list with file sizes.
+- **Download buttons everywhere** — search results, queue rows, favorites rows, and the now-playing header all get a state-aware 󰈂 button: idle → download, queued → show position, downloading → spinner with percent, saved → checkmark (click opens the Downloads tab).
+- **Offline playback** — click any row in Downloads to play it locally through the same mpv daemon.
+- **Delete from disk** — 󰅖 on any library row (guarded to the library directory only).
+- **Bigger panel** — 390×560 → 540×900 to fit the new tab.
+- **IPC additions** — `quickshell ipc call maen.omaopus download` and `... tab downloads` for keybinding integration (SUPER+ALT+D hint in the footer).
 
 ---
 

@@ -12,10 +12,20 @@ FAVORITES_JSON="$STATE_DIR/favorites.json"
 PREFS_JSON="$STATE_DIR/preferences.json"
 MPV_SOCK="$STATE_DIR/mpv.sock"
 META_JSON="$STATE_DIR/current_meta.json"
+DOWNLOAD_JSON="$STATE_DIR/download.json"
+DOWNLOADED_JSON="$STATE_DIR/downloaded.json"
+DOWNLOAD_LOG="$STATE_DIR/download.log"
+DOWNLOAD_QUEUE_JSON="$STATE_DIR/download_queue.json"
+DOWNLOAD_LOCK="$STATE_DIR/download.lock"
+ENQUEUE_LOCK="$STATE_DIR/enqueue.lock"
+MUSIC_DIR="${OMAOPUS_MUSIC_DIR:-$HOME/Music/OmaOpus}"
 
 [ -f "$FAVORITES_JSON" ] || echo '[]' > "$FAVORITES_JSON"
 [ -f "$QUEUE_JSON" ] || echo '[]' > "$QUEUE_JSON"
 [ -f "$META_JSON" ] || echo '{}' > "$META_JSON"
+[ -f "$DOWNLOAD_JSON" ] || echo '{"status":"idle","url":"","title":"","file":"","percent":0,"queue":0}' > "$DOWNLOAD_JSON"
+[ -f "$DOWNLOADED_JSON" ] || echo '[]' > "$DOWNLOADED_JSON"
+[ -f "$DOWNLOAD_QUEUE_JSON" ] || echo '[]' > "$DOWNLOAD_QUEUE_JSON"
 [ -f "$PREFS_JSON" ] || echo '{"volume":70,"activeTab":"search","soundEnabled":true,"autoPlayQueue":true,"visualizerEnabled":true,"cosmicTheme":0}' > "$PREFS_JSON"
 
 get_pref() {
@@ -108,6 +118,23 @@ resolve_stream_url() {
     echo "$resolved" > "$cache_file"
   fi
   echo "$resolved"
+}
+
+# Start the serial download worker if it is not already running. Detached
+# (setsid) so downloads survive panel/shell reloads and parent exits.
+kick_worker() {
+  # 8>/dev/null drops the inherited enqueue-lock fd so the long-lived worker
+  # never holds ENQUEUE_LOCK (that would block every future enqueue).
+  if command -v setsid >/dev/null 2>&1; then
+    setsid -f "$0" _worker >/dev/null 2>&1 8>/dev/null || true
+  else
+    nohup "$0" _worker >/dev/null 2>&1 8>/dev/null < /dev/null &
+  fi
+}
+
+# Exit 0 when a download worker currently holds the download lock.
+worker_running() {
+  ( exec 9>>"$DOWNLOAD_LOCK" && ! flock -n 9 )
 }
 
 cmd="${1:-status}"
@@ -371,6 +398,289 @@ case "$cmd" in
     cat "$FAVORITES_JSON"
     ;;
 
+  download)
+    url="$2"
+    title="${3:-}"
+    if [ -z "$url" ]; then
+      url=$(jq -r '.path // empty' "$META_JSON" 2>/dev/null || true)
+      title=$(jq -r '.title // empty' "$META_JSON" 2>/dev/null || true)
+    fi
+    [ -n "$title" ] || title="Track"
+
+    if [ -z "$url" ]; then
+      jq -n -c '{ok:false,status:"error",url:"",title:"",error:"Nothing is playing"}'
+      exit 0
+    fi
+
+    # Serialize queue read-modify-write against concurrent enqueues
+    exec 8>"$ENQUEUE_LOCK"
+    flock 8
+
+    vid_id=$(printf '%s' "$url" | grep -oP '(?<=v=)[a-zA-Z0-9_-]+' || printf '%s' "$url")
+    existing=$(jq -r --arg id "$vid_id" '.[] | select(.id == $id) | .file' "$DOWNLOADED_JSON" 2>/dev/null | head -n1 || true)
+    if [ -n "$existing" ] && [ -f "$existing" ]; then
+      jq -n -c --arg url "$url" --arg title "$title" --arg file "$existing" \
+        '{status:"done",url:$url,title:$title,file:$file,percent:100,queue:0}' > "$DOWNLOAD_JSON"
+      jq -n -c --arg url "$url" --arg title "$title" --arg file "$existing" \
+        '{ok:true,status:"done",url:$url,title:$title,file:$file,note:"already in library"}'
+      exit 0
+    fi
+
+    # Same track already downloading right now?
+    if [ "$(jq -r '.status // empty' "$DOWNLOAD_JSON" 2>/dev/null)" = "downloading" ] \
+        && [ "$(jq -r '.url // empty' "$DOWNLOAD_JSON" 2>/dev/null)" = "$url" ]; then
+      jq -n -c --arg u "$url" --arg t "$title" '{ok:true,status:"downloading",url:$u,title:$t}'
+      exit 0
+    fi
+
+    # Same track already waiting in the queue?
+    dup_pos=$(jq -r --arg u "$url" 'to_entries[] | select(.value.url == $u) | .key' "$DOWNLOAD_QUEUE_JSON" 2>/dev/null | head -n1 || true)
+    if [ -n "$dup_pos" ]; then
+      jq -n -c --argjson pos "$dup_pos" '{ok:true,status:"queued",position:($pos+1),duplicate:true}'
+      exit 0
+    fi
+
+    jq -c --arg u "$url" --arg t "$title" \
+      '. + [{url:$u, title:$t, added:(now|floor)}]' "$DOWNLOAD_QUEUE_JSON" \
+      > "$DOWNLOAD_QUEUE_JSON.tmp" && mv "$DOWNLOAD_QUEUE_JSON.tmp" "$DOWNLOAD_QUEUE_JSON"
+    qlen=$(jq 'length' "$DOWNLOAD_QUEUE_JSON")
+
+    # Release the enqueue lock before spawning the worker
+    exec 8>&-
+
+    play_sound click &
+    kick_worker
+
+    jq -n -c --arg u "$url" --arg t "$title" --argjson pos "$qlen" \
+      '{ok:true,status:"queued",url:$u,title:$t,position:$pos}'
+    ;;
+
+  download-cancel)
+    url="$2"
+    if [ -z "$url" ]; then
+      jq -n -c '{ok:false,error:"No url"}'
+      exit 0
+    fi
+    # Only queued (not the actively downloading) tracks can be dropped
+    if [ "$(jq -r '.status // empty' "$DOWNLOAD_JSON" 2>/dev/null)" = "downloading" ] \
+        && [ "$(jq -r '.url // empty' "$DOWNLOAD_JSON" 2>/dev/null)" = "$url" ]; then
+      jq -n -c '{ok:false,error:"Track is downloading right now"}'
+      exit 0
+    fi
+    exec 8>"$ENQUEUE_LOCK"
+    flock 8
+    jq -c --arg u "$url" 'map(select(.url != $u))' "$DOWNLOAD_QUEUE_JSON" \
+      > "$DOWNLOAD_QUEUE_JSON.tmp" && mv "$DOWNLOAD_QUEUE_JSON.tmp" "$DOWNLOAD_QUEUE_JSON"
+    play_sound trash &
+    jq -n -c --arg u "$url" '{ok:true, cancelled:$u}'
+    ;;
+
+  _worker)
+    # Single worker at a time: bails out if another one holds the lock
+    exec 9>"$DOWNLOAD_LOCK"
+    flock -n 9 || exit 0
+    # Drop any enqueue-lock fd inherited from the spawning `download` call
+    exec 8>&- 2>/dev/null || true
+
+    while :; do
+      # Serialize the queue pop against concurrent enqueues (append-vs-slice
+      # races here would silently drop a track)
+      exec 8>"$ENQUEUE_LOCK"
+      flock 8
+      job=$(jq -c '.[0] // empty' "$DOWNLOAD_QUEUE_JSON" 2>/dev/null || true)
+      if [ -z "$job" ]; then
+        exec 8>&-
+        break
+      fi
+
+      url=$(printf '%s' "$job" | jq -r '.url')
+      title=$(printf '%s' "$job" | jq -r '.title')
+      jq -c '.[1:]' "$DOWNLOAD_QUEUE_JSON" > "$DOWNLOAD_QUEUE_JSON.tmp" \
+        && mv "$DOWNLOAD_QUEUE_JSON.tmp" "$DOWNLOAD_QUEUE_JSON"
+      qleft=$(jq 'length' "$DOWNLOAD_QUEUE_JSON" 2>/dev/null || echo 0)
+      exec 8>&-
+
+      vid_id=$(printf '%s' "$url" | grep -oP '(?<=v=)[a-zA-Z0-9_-]+' || printf '%s' "$url")
+      existing=$(jq -r --arg id "$vid_id" '.[] | select(.id == $id) | .file' "$DOWNLOADED_JSON" 2>/dev/null | head -n1 || true)
+      if [ -n "$existing" ] && [ -f "$existing" ]; then
+        jq -n -c --arg url "$url" --arg title "$title" --arg file "$existing" --argjson q "$qleft" \
+          '{status:"done",url:$url,title:$title,file:$file,percent:100,queue:$q}' > "$DOWNLOAD_JSON"
+        continue
+      fi
+
+      mkdir -p "$MUSIC_DIR"
+      jq -n -c --arg url "$url" --arg title "$title" --argjson q "$qleft" \
+        '{status:"downloading",url:$url,title:$title,file:"",percent:0,queue:$q}' > "$DOWNLOAD_JSON"
+      : > "$DOWNLOAD_LOG"
+
+      # PYTHONUNBUFFERED: yt-dlp is Python; without a tty it block-buffers
+      # stdout, so "[download] NN%" lines would never reach the log until the
+      # whole download finished. stdbuf is kept as a second line of defense.
+      env PYTHONUNBUFFERED=1 stdbuf -oL -eL yt-dlp -x --audio-format mp3 --audio-quality 192K \
+        --embed-metadata --embed-thumbnail \
+        --trim-filenames 150 \
+        --no-playlist --no-warnings --socket-timeout 20 --newline \
+        --progress \
+        --print after_move:filepath \
+        -o "$MUSIC_DIR/%(title)s [%(id)s].%(ext)s" \
+        -- "$url" >> "$DOWNLOAD_LOG" 2>&1 &
+      ytpid=$!
+
+      # Feed live progress into download.json while yt-dlp runs
+      while kill -0 "$ytpid" 2>/dev/null; do
+        pct=$(grep -oE '\[download\][[:space:]]+[0-9.]+%' "$DOWNLOAD_LOG" 2>/dev/null | tail -n1 | grep -oE '[0-9.]+' || true)
+        if [ -n "$pct" ]; then
+          jq --argjson p "$pct" '.percent = $p' "$DOWNLOAD_JSON" > "$DOWNLOAD_JSON.tmp" \
+            && mv "$DOWNLOAD_JSON.tmp" "$DOWNLOAD_JSON"
+        fi
+        sleep 0.7
+      done
+
+      rc=0
+      wait "$ytpid" || rc=$?
+
+      if [ "$rc" -eq 0 ]; then
+        file=$(grep -E '^/' "$DOWNLOAD_LOG" | tail -n1 || true)
+        if [ -n "$file" ]; then
+          jq -c --arg id "$vid_id" --arg file "$file" \
+            '. + [{id:$id, file:$file}] | unique_by(.id)' "$DOWNLOADED_JSON" \
+            > "$DOWNLOADED_JSON.tmp" && mv "$DOWNLOADED_JSON.tmp" "$DOWNLOADED_JSON"
+        fi
+        jq -n -c --arg url "$url" --arg title "$title" --arg file "$file" --argjson q "$qleft" \
+          '{status:"done",url:$url,title:$title,file:$file,percent:100,queue:$q}' > "$DOWNLOAD_JSON"
+        play_sound favorite
+      else
+        err=$(tail -n1 "$DOWNLOAD_LOG" 2>/dev/null || echo "download failed")
+        jq -n -c --arg url "$url" --arg title "$title" --arg err "$err" --argjson q "$qleft" \
+          '{status:"error",url:$url,title:$title,file:"",percent:0,queue:$q,error:$err}' > "$DOWNLOAD_JSON"
+      fi
+    done
+
+    # If the queue drained without writing a terminal state, settle it
+    if [ "$(jq -r '.status // empty' "$DOWNLOAD_JSON" 2>/dev/null)" = "downloading" ]; then
+      jq -n -c '{status:"idle",url:"",title:"",file:"",percent:0,queue:0}' > "$DOWNLOAD_JSON"
+    fi
+    ;;
+
+  downloads-list)
+    lib_cache="$STATE_DIR/library.json"
+    audio_find=(find "$MUSIC_DIR" -maxdepth 1 -type f \
+      \( -iname '*.mp3' -o -iname '*.m4a' -o -iname '*.opus' -o -iname '*.flac' \
+         -o -iname '*.ogg' -o -iname '*.wav' -o -iname '*.webm' \))
+
+    # Self-heal: status says "downloading" but no worker holds the lock means
+    # the worker was killed mid-track. Push that job back to the FRONT of the
+    # queue so nothing is silently lost, then let the kick below resume it.
+    if [ "$(jq -r '.status // empty' "$DOWNLOAD_JSON" 2>/dev/null)" = "downloading" ] && ! worker_running; then
+      stale_url=$(jq -r '.url // empty' "$DOWNLOAD_JSON")
+      stale_title=$(jq -r '.title // "Track"' "$DOWNLOAD_JSON")
+      if [ -n "$stale_url" ] && ! jq -e --arg u "$stale_url" '.[] | select(.url == $u)' "$DOWNLOAD_QUEUE_JSON" >/dev/null 2>&1; then
+        exec 8>"$ENQUEUE_LOCK"
+        flock 8
+        jq -c --arg u "$stale_url" --arg t "$stale_title" \
+          '[{url:$u, title:$t, added:(now|floor)}] + .' "$DOWNLOAD_QUEUE_JSON" \
+          > "$DOWNLOAD_QUEUE_JSON.tmp" && mv "$DOWNLOAD_QUEUE_JSON.tmp" "$DOWNLOAD_QUEUE_JSON"
+        exec 8>&-
+      fi
+      stale_q=$(jq 'length' "$DOWNLOAD_QUEUE_JSON" 2>/dev/null || echo 0)
+      jq -n -c --arg u "$stale_url" --arg t "$stale_title" --argjson q "$stale_q" \
+        '{status:"interrupted", url:$u, title:$t, file:"", percent:0, queue:$q, error:"Interrupted - requeued"}' \
+        > "$DOWNLOAD_JSON"
+    fi
+
+    pending=$(jq -c '.' "$DOWNLOAD_QUEUE_JSON" 2>/dev/null || echo '[]')
+
+    # Crash-safe: anything waiting means a worker must be running
+    pending_len=$(jq 'length' <<<"$pending" 2>/dev/null || echo 0)
+    if [ "${pending_len:-0}" -gt 0 ] && ! worker_running; then
+      kick_worker
+    fi
+
+    sig="empty"
+    if [ -d "$MUSIC_DIR" ]; then
+      sig=$("${audio_find[@]}" -printf '%f|%s|%T@\n' 2>/dev/null | sort | md5sum | awk '{print $1}' || true)
+      [ -n "$sig" ] || sig="empty"
+    fi
+
+    songs='[]'
+    if [ -f "$lib_cache" ] && [ "$(jq -r '.sig // empty' "$lib_cache" 2>/dev/null)" = "$sig" ]; then
+      songs=$(jq -c '.songs' "$lib_cache")
+    elif [ -d "$MUSIC_DIR" ]; then
+      while IFS= read -r -d '' path; do
+        base=$(basename "$path")
+        title="${base%.*}"
+        # Strip the collision-proof id suffix: "Title [dQw4w9WgXcQ]"
+        title=$(printf '%s' "$title" | sed -E 's/ \[[A-Za-z0-9_-]{6,}\]$//')
+        size=$(stat -c %s "$path" 2>/dev/null || echo 0)
+        artist=""
+        dur=0
+        info=$(ffprobe -v error -show_entries format=duration -show_entries format_tags=artist -of json "$path" 2>/dev/null || true)
+        if [ -n "$info" ]; then
+          artist=$(printf '%s' "$info" | jq -r '.format.tags.artist // empty' 2>/dev/null || true)
+          dur=$(printf '%s' "$info" | jq -r '.format.duration // "0"' 2>/dev/null || echo 0)
+        fi
+        [ -n "$artist" ] || artist="Local file"
+        song=$(jq -n -c --arg path "$path" --arg title "$title" --arg artist "$artist" \
+          --argjson size "$size" --arg dur "$dur" \
+          '{path:$path, title:$title, artist:$artist, size:$size, duration:(($dur|tonumber?) // 0 | round)}' 2>/dev/null) || continue
+        songs=$(printf '%s' "$songs" | jq -c --argjson s "$song" '. + [$s]')
+      done < <("${audio_find[@]}" -print0 2>/dev/null | sort -z)
+      jq -n -c --arg sig "$sig" --argjson songs "$songs" '{sig:$sig, songs:$songs}' > "$lib_cache"
+    fi
+
+    saved=$(jq -c '.' "$DOWNLOADED_JSON" 2>/dev/null || echo '[]')
+    jq -n -c --argjson songs "$songs" --argjson pending "$pending" --argjson saved "$saved" \
+      '{ok:true, songs:$songs, pending:$pending, saved:$saved}'
+    ;;
+
+  play-local)
+    path="$2"
+    if [ -z "$path" ] || [ ! -f "$path" ]; then
+      jq -n -c '{ok:false,error:"File not found"}'
+      exit 0
+    fi
+    title="${3:-$(basename "$path")}"
+    title="${title%.*}"
+    artist="${4:-Local file}"
+
+    dstr=$(ffprobe -v error -show_entries format=duration -of default=nw=1:nk=1 "$path" 2>/dev/null | head -n1 || true)
+    dmin=$(awk -v d="${dstr:-0}" 'BEGIN { t = d + 0; printf "%d:%02d", t / 60, t % 60 }')
+
+    jq -n -c --arg title "$title" --arg artist "$artist" --arg path "$path" --arg duration "$dmin" \
+      '{title:$title, artist:$artist, path:$path, duration_str:$duration}' > "$META_JSON"
+
+    send_mpv "{\"command\":[\"loadfile\",$(printf '%s' "$path" | jq -R .),\"replace\"]}" >/dev/null 2>&1 || true
+    send_mpv '{"command":["set_property","pause",false]}' >/dev/null 2>&1 || true
+    play_sound play &
+    "$0" status
+    ;;
+
+  delete-download)
+    path="$2"
+    if [ -z "$path" ] || [ ! -f "$path" ]; then
+      jq -n -c '{ok:false,error:"File not found"}'
+      exit 0
+    fi
+    case "$path" in
+      "$MUSIC_DIR"/*) ;;
+      *)
+        jq -n -c '{ok:false,error:"Outside the library"}'
+        exit 0
+        ;;
+    esac
+
+    rm -f -- "$path"
+    jq -c --arg f "$path" 'map(select(.file != $f))' "$DOWNLOADED_JSON" > "$DOWNLOADED_JSON.tmp" \
+      && mv "$DOWNLOADED_JSON.tmp" "$DOWNLOADED_JSON"
+
+    cur=$(jq -r '.path // empty' "$META_JSON" 2>/dev/null || true)
+    if [ "$cur" = "$path" ]; then
+      "$0" stop >/dev/null 2>&1 || true
+    fi
+    play_sound trash &
+    jq -n -c --arg path "$path" '{ok:true, deleted:$path}'
+    ;;
+
   sound)
     play_sound "$2"
     echo '{"ok":true}'
@@ -431,7 +741,7 @@ case "$cmd" in
     ;;
 
   *)
-    echo "Usage: $0 {ensure|restart-session|prefetch <url>|status|play|pause|toggle|next|prev|stop|volume <0-100>|set-pref <key> <val>|get-prefs|play-url <url> [title] [artist] [dur]|queue-url <url> [title] [artist] [dur]|queue-list|queue-clear|set-queue <json>|favorites-list|favorites-toggle <json>|sound <name>|search <query> [limit]}"
+    echo "Usage: $0 {ensure|restart-session|prefetch <url>|status|play|pause|toggle|next|prev|stop|volume <0-100>|set-pref <key> <val>|get-prefs|play-url <url> [title] [artist] [dur]|queue-url <url> [title] [artist] [dur]|queue-list|queue-clear|set-queue <json>|favorites-list|favorites-toggle <json>|download [url] [title]|download-cancel <url>|_worker|downloads-list|play-local <path> [title] [artist]|delete-download <path>|sound <name>|search <query> [limit]}"
     exit 1
     ;;
 esac

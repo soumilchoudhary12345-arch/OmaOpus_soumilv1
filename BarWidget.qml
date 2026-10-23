@@ -19,6 +19,7 @@ Panel {
   readonly property string backendPath: Qt.resolvedUrl("oma-player").toString().replace(/^file:\/\//, "")
   readonly property string statusPath: (Quickshell.env("XDG_STATE_HOME") || (Quickshell.env("HOME") + "/.local/state")) + "/omaopus/status.json"
   readonly property string prefsPath: (Quickshell.env("XDG_STATE_HOME") || (Quickshell.env("HOME") + "/.local/state")) + "/omaopus/preferences.json"
+  readonly property string downloadPath: (Quickshell.env("XDG_STATE_HOME") || (Quickshell.env("HOME") + "/.local/state")) + "/omaopus/download.json"
 
   // Player State
   property bool isPlaying: false
@@ -50,6 +51,29 @@ Panel {
   // Favorites State
   property var favorites: []
 
+  // Download State
+  property string downloadState: "idle"
+  property string downloadUrl: ""
+  property string downloadFile: ""
+  property string downloadTitle: ""
+  property string downloadError: ""
+  property real downloadPercent: 0
+
+  // Local Library (downloaded songs) + download queue
+  property var downloads: []
+  property var pendingDownloads: []
+  property var savedDownloads: []
+
+  readonly property bool currentDownloaded: downloadState === "done" && downloadUrl !== "" && downloadUrl === currentUrl
+  readonly property bool currentDownloading: downloadState === "downloading" && downloadUrl !== "" && downloadUrl === currentUrl
+  readonly property bool currentLocal: currentUrl.indexOf("/") === 0
+  readonly property int currentPendingIndex: pendingIndexFor(currentUrl)
+  readonly property int downloadsBytes: {
+    var total = 0
+    for (var i = 0; i < downloads.length; i++) total += downloads[i].size || 0
+    return total
+  }
+
   function playSound(name) {
     if (!soundEnabled) return
     soundProc.command = [root.backendPath, "sound", name]
@@ -74,6 +98,11 @@ Panel {
   function refreshPrefs() {
     if (prefsProc.running) return
     prefsProc.running = true
+  }
+
+  function refreshDownloads() {
+    if (downloadsProc.running) return
+    downloadsProc.running = true
   }
 
   function togglePlayPause() {
@@ -199,6 +228,102 @@ Panel {
     return false
   }
 
+  function parseDownload(raw) {
+    try {
+      if (!raw || typeof raw !== "string") return
+      var d = JSON.parse(raw)
+      if (d.status) root.downloadState = d.status
+      if (d.url) root.downloadUrl = d.url
+      if (d.file !== undefined) root.downloadFile = d.file || ""
+      if (d.title) root.downloadTitle = d.title
+      if (d.percent !== undefined) root.downloadPercent = Number(d.percent) || 0
+      root.downloadError = d.error || ""
+    } catch (e) {
+      // Ignored
+    }
+  }
+
+  function parseDownloads(raw) {
+    try {
+      if (!raw || typeof raw !== "string") return
+      var d = JSON.parse(raw)
+      root.downloads = d.songs || []
+      root.pendingDownloads = d.pending || []
+      root.savedDownloads = d.saved || []
+    } catch (e) {
+      root.downloads = []
+      root.pendingDownloads = []
+      root.savedDownloads = []
+    }
+  }
+
+  function trackKey(item) {
+    if (!item) return ""
+    var k = item.id || item.url || ""
+    var m = k.match(/[?&]v=([\w-]+)/)
+    return m ? m[1] : k
+  }
+
+  function isSaved(item) {
+    if (!item) return false
+    var key = trackKey(item)
+    if (!key) return false
+    for (var i = 0; i < savedDownloads.length; i++) {
+      if (savedDownloads[i].id === key) return true
+    }
+    return false
+  }
+
+  function pendingIndexFor(url) {
+    if (!url) return -1
+    for (var i = 0; i < pendingDownloads.length; i++) {
+      if (pendingDownloads[i].url === url) return i
+    }
+    return -1
+  }
+
+  function isQueued(item) {
+    if (!item || !item.url) return false
+    if (downloadState === "downloading" && downloadUrl === item.url) return true
+    return pendingIndexFor(item.url) >= 0
+  }
+
+  function downloadCurrent() {
+    if (downloadProc.running) return
+    downloadProc.command = [root.backendPath, "download"]
+    downloadProc.running = true
+  }
+
+  function downloadTrack(item) {
+    if (!item || !item.url || downloadProc.running) return
+    downloadProc.command = [root.backendPath, "download", item.url, item.title || item.url]
+    downloadProc.running = true
+  }
+
+  function cancelPending(item) {
+    if (!item || !item.url || cancelProc.running) return
+    cancelProc.command = [root.backendPath, "download-cancel", item.url]
+    cancelProc.running = true
+  }
+
+  function playLocal(item) {
+    if (!item || !item.path) return
+    isBusy = true
+    currentTitle = item.title || "Loading..."
+    currentArtist = item.artist || ""
+    currentUrl = item.path
+    isPlaying = true
+    isPaused = false
+    actionProc.command = [root.backendPath, "play-local", item.path, item.title || "", item.artist || ""]
+    actionProc.running = true
+  }
+
+  function deleteDownload(item) {
+    if (!item || !item.path || downloadDeleteProc.running) return
+    downloadDeleteProc.command = [root.backendPath, "delete-download", item.path]
+    downloadDeleteProc.running = true
+  }
+
   function setVolume(pct) {
     volume = Math.max(0, Math.min(100, Math.round(pct)))
     execActionWithArg("volume", String(volume))
@@ -212,6 +337,7 @@ Panel {
     setPrefProc.running = true
     if (tabId === "queue") root.refreshQueue()
     if (tabId === "favorites") root.refreshFavorites()
+    if (tabId === "downloads") root.refreshDownloads()
   }
 
   function toggleSound() {
@@ -289,7 +415,7 @@ Panel {
     if (prefs.volume !== undefined && !volSlider.dragging) {
       root.volume = Math.round(prefs.volume)
     }
-    if (prefs.activeTab && (prefs.activeTab === "search" || prefs.activeTab === "queue" || prefs.activeTab === "favorites")) {
+    if (prefs.activeTab && (prefs.activeTab === "search" || prefs.activeTab === "queue" || prefs.activeTab === "favorites" || prefs.activeTab === "downloads")) {
       root.activeTab = prefs.activeTab
     }
     if (prefs.soundEnabled !== undefined) {
@@ -322,6 +448,12 @@ Panel {
     return m + ":" + (s < 10 ? "0" : "") + s
   }
 
+  function formatSize(bytes) {
+    if (!bytes || bytes <= 0) return "0 MB"
+    if (bytes < 1024 * 1024) return Math.round(bytes / 1024) + " KB"
+    return (bytes / (1024 * 1024)).toFixed(1) + " MB"
+  }
+
   visible: true
   implicitWidth: iconContainer.width
   implicitHeight: bar ? bar.barSize : Style.bar.sizeHorizontal
@@ -336,6 +468,7 @@ Panel {
       if (root.opened) {
         if (root.activeTab === "queue") root.refreshQueue()
         if (root.activeTab === "favorites") root.refreshFavorites()
+        root.refreshDownloads()
       }
     }
   }
@@ -356,6 +489,15 @@ Panel {
     atomicWrites: true
     printErrors: false
     onLoaded: root.parsePrefs(text())
+    onFileChanged: reload()
+  }
+
+  FileView {
+    path: root.downloadPath
+    watchChanges: true
+    atomicWrites: true
+    printErrors: false
+    onLoaded: root.parseDownload(text())
     onFileChanged: reload()
   }
 
@@ -386,6 +528,19 @@ Panel {
     id: actionProc
     command: []
     onExited: root.refreshStatus()
+  }
+
+  Process {
+    id: downloadProc
+    command: []
+    stdout: StdioCollector {
+      waitForEnd: true
+      onTextChanged: if (text) root.parseDownload(text)
+    }
+    onExited: {
+      root.refreshStatus()
+      root.refreshDownloads()
+    }
   }
 
   Process {
@@ -450,6 +605,32 @@ Panel {
   }
 
   Process {
+    id: downloadsProc
+    command: [root.backendPath, "downloads-list"]
+    stdout: StdioCollector {
+      id: downloadsOut
+      waitForEnd: true
+    }
+    onExited: function(exitCode) {
+      if (exitCode === 0 && downloadsOut.text) {
+        root.parseDownloads(downloadsOut.text)
+      }
+    }
+  }
+
+  Process {
+    id: downloadDeleteProc
+    command: []
+    onExited: root.refreshDownloads()
+  }
+
+  Process {
+    id: cancelProc
+    command: []
+    onExited: root.refreshDownloads()
+  }
+
+  Process {
     id: prefetchProc
     command: []
   }
@@ -497,6 +678,8 @@ Panel {
     function play(): void { root.togglePlayPause() }
     function next(): void { root.nextTrack() }
     function prev(): void { root.prevTrack() }
+    function download(): void { root.downloadCurrent() }
+    function tab(name: string): void { root.setActiveTab(name) }
   }
 
   // Bar Widget: Icon ONLY
@@ -605,8 +788,8 @@ Panel {
     bar: root.bar
     open: root.opened
     focusTarget: searchField
-    contentWidth: panel.fittedContentWidth(Style.space(390))
-    contentHeight: panel.fittedContentHeight(mainColumn.implicitHeight, Style.space(560))
+    contentWidth: panel.fittedContentWidth(Style.space(540))
+    contentHeight: panel.fittedContentHeight(mainColumn.implicitHeight, Style.space(900))
 
     onOpenChanged: {
       if (open) {
@@ -614,6 +797,7 @@ Panel {
         root.refreshPrefs()
         if (root.activeTab === "queue") root.refreshQueue()
         if (root.activeTab === "favorites") root.refreshFavorites()
+        root.refreshDownloads()
       }
     }
 
@@ -700,11 +884,12 @@ Panel {
           model: [
             { id: "search", name: "󰍉 Search" },
             { id: "queue", name: "󰒮 Queue (" + root.queueTracks.length + ")" },
-            { id: "favorites", name: "󰋑 Favorites (" + root.favorites.length + ")" }
+            { id: "favorites", name: "󰋑 Favs (" + root.favorites.length + ")" },
+            { id: "downloads", name: "󰈂 Downloads (" + root.downloads.length + ")" }
           ]
 
           Rectangle {
-            width: (parent.width - Style.space(12)) / 3
+            width: (parent.width - Style.space(18)) / 4
             height: Style.space(28)
             radius: Style.cornerRadius
             color: root.activeTab === modelData.id
@@ -752,7 +937,7 @@ Panel {
             spacing: Style.space(6)
 
             Text {
-              width: parent.width - (root.currentTitle ? favHeaderBtn.width + Style.space(6) : 0)
+              width: parent.width - (root.currentTitle ? favHeaderBtn.width + dlHeaderBtn.width + Style.space(12) : 0)
               text: root.currentTitle ? root.currentTitle : "No song playing"
               color: root.foreground
               font.family: root.fontFamily
@@ -777,6 +962,34 @@ Panel {
                   url: root.currentUrl,
                   duration: root.formatTime(root.totalDurationSec)
                 })
+              }
+            }
+
+            PanelActionButton {
+              id: dlHeaderBtn
+              visible: root.currentTitle !== ""
+              iconText: root.currentDownloading ? "󰑮"
+                : ((root.currentDownloaded || root.currentLocal) ? "󰄲"
+                    : (root.currentPendingIndex >= 0 ? "󰒮" : "󰈂"))
+              tooltipText: root.currentDownloading
+                ? "Downloading " + root.downloadTitle + "  (" + Math.round(root.downloadPercent) + "%)"
+                : (root.currentLocal
+                    ? "Saved in your library (~/Music/OmaOpus)"
+                    : (root.currentDownloaded
+                        ? "Saved to " + (root.downloadFile || "~/Music/OmaOpus")
+                        : (root.currentPendingIndex >= 0
+                            ? "Queued - position " + (root.currentPendingIndex + 1) + " (click to open Downloads)"
+                            : (root.downloadState === "error" && root.downloadUrl === root.currentUrl
+                                ? "Download failed: " + root.downloadError
+                                : "Download as MP3 to ~/Music/OmaOpus"))))
+              size: Style.space(22)
+              anchors.verticalCenter: parent.verticalCenter
+              onClicked: {
+                if (root.currentLocal || root.currentPendingIndex >= 0 || root.currentDownloaded) {
+                  root.setActiveTab("downloads")
+                } else {
+                  root.downloadCurrent()
+                }
               }
             }
           }
@@ -911,7 +1124,7 @@ Panel {
         ListView {
           id: resultsList
           width: parent.width - Style.space(28)
-          height: Math.min(Style.space(190), Math.max(Style.space(48), count * Style.space(46)))
+          height: Math.min(Style.space(300), Math.max(Style.space(48), count * Style.space(46)))
           clip: true
           model: root.searchResults
 
@@ -966,7 +1179,7 @@ Panel {
               }
 
               Column {
-                width: parent.width - queueBtn.width - favRowBtn.width - timeText.width - Style.space(40)
+                width: parent.width - queueBtn.width - favRowBtn.width - dlRowBtn.width - timeText.width - Style.space(48)
                 anchors.verticalCenter: parent.verticalCenter
                 spacing: Style.space(2)
 
@@ -1014,6 +1227,20 @@ Panel {
                 size: Style.space(24)
                 anchors.verticalCenter: parent.verticalCenter
                 onClicked: root.queueTrack(modelData)
+              }
+
+              PanelActionButton {
+                id: dlRowBtn
+                iconText: (root.downloadState === "downloading" && root.downloadUrl === modelData.url) ? "󰑮"
+                  : (root.isQueued(modelData) ? "󰒮" : (root.isSaved(modelData) ? "󰄲" : "󰈂"))
+                tooltipText: (root.downloadState === "downloading" && root.downloadUrl === modelData.url) ? "Downloading..."
+                  : (root.isQueued(modelData) ? "Queued - click to open Downloads" : (root.isSaved(modelData) ? "Already saved - click to open Downloads" : "Download as MP3"))
+                size: Style.space(24)
+                anchors.verticalCenter: parent.verticalCenter
+                onClicked: {
+                  if (root.isSaved(modelData) || root.isQueued(modelData)) root.setActiveTab("downloads")
+                  else root.downloadTrack(modelData)
+                }
               }
             }
           }
@@ -1063,7 +1290,7 @@ Panel {
         ListView {
           id: queueList
           width: parent.width - Style.space(28)
-          height: Math.min(Style.space(190), Math.max(Style.space(48), count * Style.space(46)))
+          height: Math.min(Style.space(300), Math.max(Style.space(48), count * Style.space(46)))
           clip: true
           model: root.queueTracks
 
@@ -1103,7 +1330,7 @@ Panel {
               }
 
               Column {
-                width: parent.width - Style.space(40)
+                width: parent.width - dlQueueBtn.width - Style.space(48)
                 anchors.verticalCenter: parent.verticalCenter
                 spacing: Style.space(2)
 
@@ -1123,6 +1350,20 @@ Panel {
                   font.family: root.fontFamily
                   font.pixelSize: Style.font.caption
                   elide: Text.ElideRight
+                }
+              }
+
+              PanelActionButton {
+                id: dlQueueBtn
+                iconText: (root.downloadState === "downloading" && root.downloadUrl === modelData.url) ? "󰑮"
+                  : (root.isQueued(modelData) ? "󰒮" : (root.isSaved(modelData) ? "󰄲" : "󰈂"))
+                tooltipText: (root.downloadState === "downloading" && root.downloadUrl === modelData.url) ? "Downloading..."
+                  : (root.isQueued(modelData) ? "Queued - click to open Downloads" : (root.isSaved(modelData) ? "Already saved - click to open Downloads" : "Download as MP3"))
+                size: Style.space(24)
+                anchors.verticalCenter: parent.verticalCenter
+                onClicked: {
+                  if (root.isSaved(modelData) || root.isQueued(modelData)) root.setActiveTab("downloads")
+                  else root.downloadTrack(modelData)
                 }
               }
             }
@@ -1149,7 +1390,7 @@ Panel {
         ListView {
           id: favList
           width: parent.width - Style.space(28)
-          height: Math.min(Style.space(190), Math.max(Style.space(48), count * Style.space(46)))
+          height: Math.min(Style.space(300), Math.max(Style.space(48), count * Style.space(46)))
           clip: true
           model: root.favorites
 
@@ -1187,7 +1428,7 @@ Panel {
               }
 
               Column {
-                width: parent.width - favDelBtn.width - Style.space(36)
+                width: parent.width - favDelBtn.width - dlFavBtn.width - Style.space(44)
                 anchors.verticalCenter: parent.verticalCenter
                 spacing: Style.space(2)
 
@@ -1211,6 +1452,20 @@ Panel {
               }
 
               PanelActionButton {
+                id: dlFavBtn
+                iconText: (root.downloadState === "downloading" && root.downloadUrl === modelData.url) ? "󰑮"
+                  : (root.isQueued(modelData) ? "󰒮" : (root.isSaved(modelData) ? "󰄲" : "󰈂"))
+                tooltipText: (root.downloadState === "downloading" && root.downloadUrl === modelData.url) ? "Downloading..."
+                  : (root.isQueued(modelData) ? "Queued - click to open Downloads" : (root.isSaved(modelData) ? "Already saved - click to open Downloads" : "Download as MP3"))
+                size: Style.space(24)
+                anchors.verticalCenter: parent.verticalCenter
+                onClicked: {
+                  if (root.isSaved(modelData) || root.isQueued(modelData)) root.setActiveTab("downloads")
+                  else root.downloadTrack(modelData)
+                }
+              }
+
+              PanelActionButton {
                 id: favDelBtn
                 iconText: "󰅖"
                 tooltipText: "Remove Favorite"
@@ -1228,6 +1483,265 @@ Panel {
           color: root.muted
           font.family: root.fontFamily
           font.pixelSize: Style.font.caption
+          horizontalAlignment: Text.AlignHCenter
+          width: parent.width - Style.space(28)
+        }
+      }
+
+      // TAB 4: DOWNLOADED LIBRARY
+      Column {
+        visible: root.activeTab === "downloads"
+        width: parent.width
+        spacing: Style.space(8)
+
+        // Active download + live progress
+        Rectangle {
+          visible: root.downloadState === "downloading" || root.downloadState === "interrupted"
+          width: parent.width - Style.space(28)
+          height: Style.space(78)
+          radius: Style.cornerRadius
+          color: Style.selectedFillFor(root.foreground, root.accent)
+
+          Column {
+            anchors.fill: parent
+            anchors.margins: Style.space(10)
+            spacing: Style.space(5)
+
+            Row {
+              width: parent.width
+              spacing: Style.space(6)
+
+              Text {
+                text: root.downloadState === "interrupted" ? "󰅣 INTERRUPTED" : "󰈂 DOWNLOADING"
+                color: root.foreground
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+                font.bold: true
+                anchors.verticalCenter: parent.verticalCenter
+              }
+              Item {
+                width: parent.width - x - dlPctText.width
+                height: 1
+              }
+              Text {
+                id: dlPctText
+                text: Math.round(root.downloadPercent) + "%"
+                color: root.accent
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+                font.bold: true
+                anchors.verticalCenter: parent.verticalCenter
+              }
+            }
+
+            Text {
+              width: parent.width
+              text: (root.downloadTitle || "Track") + (root.pendingDownloads.length > 0 ? "  ·  " + root.pendingDownloads.length + " queued" : "")
+              color: root.foreground
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.body
+              elide: Text.ElideRight
+            }
+
+            Rectangle {
+              width: parent.width
+              height: Style.space(6)
+              radius: Style.space(3)
+              color: Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.18)
+
+              Rectangle {
+                width: Math.max(Style.space(6), parent.width * Math.min(1, Math.max(0, root.downloadPercent / 100)))
+                height: parent.height
+                radius: parent.radius
+                color: root.accent
+                Behavior on width { NumberAnimation { duration: 400 } }
+              }
+            }
+          }
+        }
+
+        // Waiting queue (click to cancel)
+        ListView {
+          id: dlPendingList
+          visible: root.pendingDownloads.length > 0
+          width: parent.width - Style.space(28)
+          height: Math.min(Style.space(120), Math.max(Style.space(30), count * Style.space(30)))
+          clip: true
+          model: root.pendingDownloads
+
+          delegate: Rectangle {
+            width: dlPendingList.width
+            height: Style.space(28)
+            radius: Style.cornerRadius
+            color: pendMouse.containsMouse ? Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.08) : "transparent"
+
+            MouseArea {
+              id: pendMouse
+              anchors.fill: parent
+              hoverEnabled: true
+              cursorShape: Qt.PointingHandCursor
+              onClicked: root.cancelPending(modelData)
+            }
+
+            Row {
+              anchors.fill: parent
+              anchors.leftMargin: Style.space(8)
+              anchors.rightMargin: Style.space(8)
+              spacing: Style.space(8)
+
+              Text {
+                text: "#" + (index + 1)
+                color: root.muted
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+                width: Style.space(24)
+                anchors.verticalCenter: parent.verticalCenter
+              }
+
+              Text {
+                width: parent.width - Style.space(80)
+                text: modelData.title || ""
+                color: root.dim
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+                elide: Text.ElideRight
+                anchors.verticalCenter: parent.verticalCenter
+              }
+
+              Text {
+                text: "󰒮 queued"
+                color: root.muted
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+                anchors.verticalCenter: parent.verticalCenter
+              }
+            }
+          }
+        }
+
+        Row {
+          width: parent.width - Style.space(28)
+          Text {
+            text: "DOWNLOADED TRACKS"
+            color: root.dim
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.caption
+            font.bold: true
+            anchors.verticalCenter: parent.verticalCenter
+          }
+          Item {
+            width: parent.width - x - dlSummaryText.width
+            height: 1
+          }
+          Text {
+            id: dlSummaryText
+            text: root.downloads.length + (root.downloads.length === 1 ? " song · " : " songs · ") + root.formatSize(root.downloadsBytes)
+            + (root.pendingDownloads.length > 0 ? "  ·  " + root.pendingDownloads.length + " queued" : "")
+            color: root.muted
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.caption
+            anchors.verticalCenter: parent.verticalCenter
+          }
+        }
+
+        ListView {
+          id: dlList
+          width: parent.width - Style.space(28)
+          height: Math.min(Style.space(300), Math.max(Style.space(48), count * Style.space(50)))
+          clip: true
+          model: root.downloads
+
+          delegate: Rectangle {
+            width: dlList.width
+            height: Style.space(48)
+            radius: Style.cornerRadius
+            color: root.currentUrl === modelData.path
+              ? Style.selectedFillFor(root.foreground, root.accent)
+              : (dlMouse.containsMouse ? Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.08) : "transparent")
+
+            MouseArea {
+              id: dlMouse
+              anchors.fill: parent
+              hoverEnabled: true
+              cursorShape: Qt.PointingHandCursor
+              onClicked: root.playLocal(modelData)
+            }
+
+            Row {
+              anchors.fill: parent
+              anchors.leftMargin: Style.space(8)
+              anchors.rightMargin: Style.space(8)
+              spacing: Style.space(8)
+
+              Text {
+                text: "󰐊"
+                color: root.currentUrl === modelData.path ? root.accent : root.muted
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+                anchors.verticalCenter: parent.verticalCenter
+              }
+
+              Column {
+                width: parent.width - dlDelBtn.width - dlSizeLabel.width - Style.space(48)
+                anchors.verticalCenter: parent.verticalCenter
+                spacing: Style.space(2)
+
+                Text {
+                  width: parent.width
+                  text: modelData.title || ""
+                  color: root.foreground
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.body
+                  elide: Text.ElideRight
+                }
+
+                Text {
+                  width: parent.width
+                  text: (modelData.artist || "") + (modelData.duration > 0 ? "  ·  " + root.formatTime(modelData.duration) : "")
+                  color: root.dim
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.caption
+                  elide: Text.ElideRight
+                }
+              }
+
+              Text {
+                id: dlSizeLabel
+                text: root.formatSize(modelData.size)
+                color: root.muted
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+                anchors.verticalCenter: parent.verticalCenter
+              }
+
+              PanelActionButton {
+                id: dlDelBtn
+                iconText: "󰅖"
+                tooltipText: "Delete file from disk"
+                size: Style.space(24)
+                anchors.verticalCenter: parent.verticalCenter
+                onClicked: root.deleteDownload(modelData)
+              }
+            }
+          }
+        }
+
+        Text {
+          visible: root.downloads.length === 0
+          text: "Nothing saved yet. Play a track and hit ⭳ in the player, or press SUPER+ALT+D."
+          color: root.muted
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.caption
+          horizontalAlignment: Text.AlignHCenter
+          width: parent.width - Style.space(28)
+        }
+
+        Text {
+          visible: root.downloads.length > 0
+          text: "Files live in ~/Music/OmaOpus — click a row to play offline."
+          color: root.muted
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.caption * 0.9
           horizontalAlignment: Text.AlignHCenter
           width: parent.width - Style.space(28)
         }
@@ -1270,6 +1784,13 @@ Panel {
           font.family: root.fontFamily
           font.pixelSize: Style.font.caption * 0.9
         }
+
+        Text {
+          text: "󰈂 SUPER+ALT+D"
+          color: root.muted
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.caption * 0.9
+        }
       }
     }
   }
@@ -1278,5 +1799,6 @@ Panel {
     root.refreshStatus()
     root.refreshFavorites()
     root.refreshPrefs()
+    root.refreshDownloads()
   }
 }
